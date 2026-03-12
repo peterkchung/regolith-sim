@@ -1,1 +1,4 @@
 .venv
+.env
+output/
+.ruff_cache/
