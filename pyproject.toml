@@ -2,10 +2,11 @@
 name = "regolith-sim"
 version = "0.1.0"
 description = "Newton engine lunar regolith sim using MPM"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "warp-lang[examples]",
     "numpy",
+    "newton>=1.0.0",
 ]
 
 [project.optional-dependencies]
