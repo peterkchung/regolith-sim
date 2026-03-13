@@ -123,7 +123,7 @@ class LunarRegolithSimulation:
         print("=" * 60)
 
     def emit_particles(self, builder, options):
-        """Create particle grid for regolith bed"""
+        """Create particle grid for regolith falling into container"""
 
         density = options.density
         voxel_size = self.voxel_size
@@ -164,10 +164,13 @@ class LunarRegolithSimulation:
         print(f"  Particle mass: {mass:.6f} kg")
         print(f"  Target particles: {self.target_particles:,}")
 
+        # Spawn particles above the container so they fall in
+        spawn_height = self.domain_z + 0.5  # 0.5m above container
+
         builder.add_particle_grid(
-            pos=wp.vec3(0.0, 0.0, 0.0),
+            pos=wp.vec3(0.0, 0.0, spawn_height),  # Start above container
             rot=wp.quat_identity(),
-            vel=wp.vec3(0.0, 0.0, 0.0),
+            vel=wp.vec3(0.0, 0.0, 0.0),  # Start at rest - let lunar gravity do the work
             dim_x=dim_x + 1,
             dim_y=dim_y + 1,
             dim_z=dim_z + 1,
@@ -182,6 +185,9 @@ class LunarRegolithSimulation:
 
         actual_particles = (dim_x + 1) * (dim_y + 1) * (dim_z + 1)
         print(f"  Actual particles: {actual_particles:,}")
+        print(
+            f"  Spawn height: {spawn_height:.2f}m above container (lunar gravity will do the work)"
+        )
 
     def add_container(self, builder, options):
         """Add rigid container boundaries"""
@@ -195,72 +201,77 @@ class LunarRegolithSimulation:
 
         wall_thickness = 0.02  # 2cm
 
-        # Ground plane
+        # Ground plane (always present)
         builder.add_ground_plane(cfg=container_cfg)
 
-        # Back wall (y=0)
-        builder.add_shape_box(
-            body=-1,
-            cfg=container_cfg,
-            xform=wp.transform(
-                wp.vec3(self.domain_x / 2, -wall_thickness / 2, self.domain_z / 2),
-                wp.quat_identity(),
-            ),
-            hx=self.domain_x / 2,
-            hy=wall_thickness / 2,
-            hz=self.domain_z / 2,
-        )
-
-        # Front wall (y=domain_y)
-        builder.add_shape_box(
-            body=-1,
-            cfg=container_cfg,
-            xform=wp.transform(
-                wp.vec3(
-                    self.domain_x / 2,
-                    self.domain_y + wall_thickness / 2,
-                    self.domain_z / 2,
+        if options.walled_container:
+            # Back wall (y=0)
+            builder.add_shape_box(
+                body=-1,
+                cfg=container_cfg,
+                xform=wp.transform(
+                    wp.vec3(self.domain_x / 2, -wall_thickness / 2, self.domain_z / 2),
+                    wp.quat_identity(),
                 ),
-                wp.quat_identity(),
-            ),
-            hx=self.domain_x / 2,
-            hy=wall_thickness / 2,
-            hz=self.domain_z / 2,
-        )
+                hx=self.domain_x / 2,
+                hy=wall_thickness / 2,
+                hz=self.domain_z / 2,
+            )
 
-        # Left wall (x=0)
-        builder.add_shape_box(
-            body=-1,
-            cfg=container_cfg,
-            xform=wp.transform(
-                wp.vec3(-wall_thickness / 2, self.domain_y / 2, self.domain_z / 2),
-                wp.quat_identity(),
-            ),
-            hx=wall_thickness / 2,
-            hy=self.domain_y / 2,
-            hz=self.domain_z / 2,
-        )
-
-        # Right wall (x=domain_x)
-        builder.add_shape_box(
-            body=-1,
-            cfg=container_cfg,
-            xform=wp.transform(
-                wp.vec3(
-                    self.domain_x + wall_thickness / 2,
-                    self.domain_y / 2,
-                    self.domain_z / 2,
+            # Front wall (y=domain_y)
+            builder.add_shape_box(
+                body=-1,
+                cfg=container_cfg,
+                xform=wp.transform(
+                    wp.vec3(
+                        self.domain_x / 2,
+                        self.domain_y + wall_thickness / 2,
+                        self.domain_z / 2,
+                    ),
+                    wp.quat_identity(),
                 ),
-                wp.quat_identity(),
-            ),
-            hx=wall_thickness / 2,
-            hy=self.domain_y / 2,
-            hz=self.domain_z / 2,
-        )
+                hx=self.domain_x / 2,
+                hy=wall_thickness / 2,
+                hz=self.domain_z / 2,
+            )
 
-        print(f"\nContainer:")
-        print(f"  Ground plane + 4 walls")
-        print(f"  Wall thickness: {wall_thickness * 100:.1f} cm")
+            # Left wall (x=0)
+            builder.add_shape_box(
+                body=-1,
+                cfg=container_cfg,
+                xform=wp.transform(
+                    wp.vec3(-wall_thickness / 2, self.domain_y / 2, self.domain_z / 2),
+                    wp.quat_identity(),
+                ),
+                hx=wall_thickness / 2,
+                hy=self.domain_y / 2,
+                hz=self.domain_z / 2,
+            )
+
+            # Right wall (x=domain_x)
+            builder.add_shape_box(
+                body=-1,
+                cfg=container_cfg,
+                xform=wp.transform(
+                    wp.vec3(
+                        self.domain_x + wall_thickness / 2,
+                        self.domain_y / 2,
+                        self.domain_z / 2,
+                    ),
+                    wp.quat_identity(),
+                ),
+                hx=wall_thickness / 2,
+                hy=self.domain_y / 2,
+                hz=self.domain_z / 2,
+            )
+
+            print(f"\nContainer:")
+            print(f"  Ground plane + 4 walls (boxed)")
+            print(f"  Wall thickness: {wall_thickness * 100:.1f} cm")
+        else:
+            print(f"\nContainer:")
+            print(f"  Open ground plane (berm/pile formation)")
+            print(f"  Regolith will spread and pile naturally")
 
     def set_material_properties(self, options):
         """Set per-particle material properties for lunar regolith"""
@@ -376,7 +387,12 @@ def main():
     parser.add_argument("--domain-y", type=float, default=1.0, help="Domain size Y (m)")
     parser.add_argument("--domain-z", type=float, default=0.5, help="Domain size Z (m)")
     parser.add_argument(
-        "--target-particles", type=int, default=500000, help="Target particle count"
+        "--walled-container",
+        action="store_true",
+        help="Use 4-wall container (default is open ground for berming)",
+    )
+    parser.add_argument(
+        "--target-particles", type=int, default=100000, help="Target particle count"
     )
     parser.add_argument(
         "--total-frames", type=int, default=1000, help="Total simulation frames"
@@ -462,7 +478,7 @@ def main():
     sim = LunarRegolithSimulation(viewer, args)
 
     # Run simulation
-    print(f"\nRunning simulation for {args.total_frames} frames...")
+    print(f"\nRunning simulation for {args.total_frames} frames at {args.fps} FPS...")
     print("-" * 60)
 
     newton.examples.run(sim, args)
