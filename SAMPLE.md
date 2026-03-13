@@ -1,10 +1,10 @@
 # Lunar Regolith MPM Simulation - Simple Example
 
-This is a minimal example of using Newton's Material Point Method (MPM) solver to simulate lunar regolith (granular material) falling onto a surface under lunar gravity on an RTX 3090.
+This is a minimal example of using Newton's Material Point Method (MPM) solver to simulate lunar regolith (granular material) pouring onto a surface under lunar gravity on an RTX 3090.
 
 ## Overview
 
-This example creates particles above a 1m × 1m surface that fall under lunar gravity and form a pile/berm. The example uses 50,000 particles by default.
+This example creates a narrow stream of particles above a 1m × 1m surface that pours down under lunar gravity and forms a pile. The example uses 50,000 particles by default with softer material properties for improved flow visualization.
 
 ## Prerequisites
 
@@ -37,14 +37,14 @@ DOMAIN_X, DOMAIN_Y, DOMAIN_Z = 1.0, 1.0, 0.5
 PARTICLE_COUNT = 50_000       # Number of particles
 VOXEL_SIZE = 0.02             # Grid resolution (m)
 FPS = 30.0                    # Output frame rate
-SUBSTEPS = 5                  # Physics substeps per frame
+SUBSTEPS = 10                 # Physics substeps per frame (increased for better collision)
 TOTAL_FRAMES = 100            # Simulation length
 
-# Lunar regolith material properties
+# Lunar regolith material properties - tuned for flow
 DENSITY = 1500.0              # kg/m³ (loose upper regolith)
-YOUNG_MODULUS = 50e6          # Pa (50 MPa - compacted regolith)
+YOUNG_MODULUS = 10e6          # Pa (10 MPa - softer for better flow)
 POISSON_RATIO = 0.3           # Typical soil value
-FRICTION = 0.6                # ~35° friction angle
+FRICTION = 0.85               # ~40° friction angle (higher for chaotic collisions)
 YIELD_PRESSURE = 5e3          # Pa (low compressive strength)
 GRAVITY = (0.0, 0.0, -1.62)   # Lunar gravity (m/s²)
 
@@ -77,28 +77,42 @@ def main():
     # Adjust for domain aspect ratio
     dim_x = int(cells_per_side * (DOMAIN_X / DOMAIN_Y) ** (1/3))
     dim_y = int(cells_per_side * (DOMAIN_Y / DOMAIN_X) ** (1/3))
-    dim_z = int(cells_per_side * (DOMAIN_Z / DOMAIN_X) ** (1/3))
+    # -------------------------------------------------------------------------
+    # Step 2: Add particle grid as narrow pour stream
+    # -------------------------------------------------------------------------
+    # Calculate grid dimensions for target particle count
+    particles_per_cell = 3
+    total_cells = PARTICLE_COUNT / particles_per_cell
+    cells_per_side = int(np.cbrt(total_cells))
+    
+    # Adjust for domain aspect ratio - narrow stream for pouring effect
+    stream_width_factor = 0.15  # 15% of domain width
+    dim_x = int(cells_per_side * (DOMAIN_X / DOMAIN_Y) ** (1/3) * stream_width_factor)
+    dim_y = int(cells_per_side * (DOMAIN_Y / DOMAIN_X) ** (1/3) * stream_width_factor)
+    dim_z = int(cells_per_side * (DOMAIN_Z / DOMAIN_X) ** (1/3) * 2.5)  # Taller for stream
     
     # Calculate actual cell sizes
-    cell_x = DOMAIN_X / dim_x
-    cell_y = DOMAIN_Y / dim_y
-    cell_z = DOMAIN_Z / dim_z
+    cell_x = DOMAIN_X * stream_width_factor / dim_x
+    cell_y = DOMAIN_Y * stream_width_factor / dim_y
+    cell_z = DOMAIN_Z * 3 / dim_z  # Stretch vertically
     cell_volume = cell_x * cell_y * cell_z
     
     # Per-particle properties
     particle_mass = cell_volume * DENSITY
     particle_radius = max(cell_x, cell_y, cell_z) * 0.5
     
-    print(f"\nGrid: {dim_x} x {dim_y} x {dim_z} cells")
+    print(f"\nStream grid: {dim_x} x {dim_y} x {dim_z} cells")
     print(f"Voxel size: {VOXEL_SIZE:.3f} m")
     print(f"Particle mass: {particle_mass:.6f} kg")
     
-    # Add particles in a grid layout - spawn above surface so they fall naturally
-    spawn_height = DOMAIN_Z + 0.5  # 0.5m above ground
+    # Add particles as narrow stream above surface - extreme jitter for fluid-like pour
+    spawn_height = DOMAIN_Z * 2.5  # High above ground for dramatic fall
     builder.add_particle_grid(
-        pos=wp.vec3(0.0, 0.0, spawn_height),
+        pos=wp.vec3(DOMAIN_X/2 - (DOMAIN_X*stream_width_factor)/2, 
+                    DOMAIN_Y/2 - (DOMAIN_Y*stream_width_factor)/2, 
+                    spawn_height),
         rot=wp.quat_identity(),
-        vel=wp.vec3(0.0, 0.0, 0.0),  # Start at rest - let lunar gravity do the work
+        vel=wp.vec3(0.0, 0.0, 0.0),  # Start at rest - lunar gravity does the work
         dim_x=dim_x + 1,
         dim_y=dim_y + 1,
         dim_z=dim_z + 1,
@@ -106,7 +120,7 @@ def main():
         cell_y=cell_y,
         cell_z=cell_z,
         mass=particle_mass,
-        jitter=2.0 * particle_radius,  # Randomize positions slightly
+        jitter=8.0 * particle_radius,  # Extreme jitter for fluid-like appearance
         radius_mean=particle_radius,
         flags=newton.ParticleFlags.ACTIVE,
     )
@@ -121,20 +135,21 @@ def main():
         has_particle_collision=True,
     )
     
-    # Ground plane only (particles form a pile/berm naturally)
-    builder.add_ground_plane(cfg=wall_cfg)
+    # Small collision box (50% of domain) so particles pile and spill over
+    floor_scale = 0.5
+    builder.add_shape_box(
+        body=-1,
+        cfg=wall_cfg,
+        xform=wp.transform(
+            wp.vec3(DOMAIN_X/2, DOMAIN_Y/2, -0.01),
+            wp.quat_identity()
+        ),
+        hx=DOMAIN_X*floor_scale/2,
+        hy=DOMAIN_Y*floor_scale/2,
+        hz=0.01,
+    )
     
-    print(f"Added ground plane (open surface - particles will pile/berm)")
-    
-    # Optional: Uncomment to add 4 walls for a boxed container
-    # wall_thickness = 0.02
-    # # Back wall (y=0)
-    # builder.add_shape_box(
-    #     body=-1, cfg=wall_cfg,
-    #     xform=wp.transform(wp.vec3(DOMAIN_X/2, -wall_thickness/2, DOMAIN_Z/2), wp.quat_identity()),
-    #     hx=DOMAIN_X/2, hy=wall_thickness/2, hz=DOMAIN_Z/2,
-    # )
-    # # ... add other walls similarly
+    print(f"Added small floor tile ({floor_scale*100:.0f}% of domain) - particles will pile and spill")
     
     # -------------------------------------------------------------------------
     # Step 4: Finalize the model
