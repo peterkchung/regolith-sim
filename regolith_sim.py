@@ -272,7 +272,10 @@ class LunarRegolithSimulation:
         )
 
         # Try to capture CUDA graph for faster simulation
-        self._capture()
+        # DISABLED: Causing memory issues with two-way coupling
+        # self._capture()
+        self.graph = None
+        print("  CUDA graph capture: Disabled (using normal simulation)")
 
         print("\n" + "=" * 60)
         print("Simulation initialized successfully!")
@@ -602,7 +605,10 @@ def main():
     )
     parser.add_argument("--fps", type=float, default=60.0, help="Output frame rate")
     parser.add_argument(
-        "--substeps", type=int, default=4, help="Physics substeps per frame"
+        "--substeps",
+        type=int,
+        default=8,
+        help="Physics substeps per frame (higher=more stable)",
     )
     parser.add_argument(
         "--gravity",
@@ -631,14 +637,15 @@ def main():
         "--ground-friction", type=float, default=0.5, help="Ground friction"
     )
 
-    # Material properties (STIFF GRANULAR - like the example_mpm_granular.py)
+    # Material properties (LUNAR REGOLITH - stable for simulation)
+    # Realistic values based on lunar soil properties
     parser.add_argument(
         "--density", type=float, default=1500.0, help="Material density (kg/m³)"
     )
     parser.add_argument(
         "--young-modulus",
         type=float,
-        default=1.0e15,  # Very stiff like the granular example
+        default=1.0e7,  # 10 MPa - realistic for compacted regolith (was 1e15)
         help="Young's modulus (Pa)",
     )
     parser.add_argument(
@@ -650,13 +657,13 @@ def main():
     parser.add_argument(
         "--friction",
         type=float,
-        default=0.68,  # Higher friction like the granular example (~34°)
+        default=0.6,  # Realistic for lunar regolith (~31°)
         help="Friction coefficient",
     )
     parser.add_argument(
         "--yield-pressure",
         type=float,
-        default=1.0e12,  # Very high like the granular example
+        default=1.0e4,  # 10 kPa - realistic yield stress (was 1e12)
         help="Yield pressure (Pa)",
     )
     parser.add_argument(
