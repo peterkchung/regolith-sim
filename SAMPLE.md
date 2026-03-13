@@ -1,10 +1,10 @@
 # Lunar Regolith MPM Simulation - Simple Example
 
-This is a minimal example of using Newton's Material Point Method (MPM) solver to simulate lunar regolith (granular material) on an RTX 3090.
+This is a minimal example of using Newton's Material Point Method (MPM) solver to simulate lunar regolith (granular material) falling onto a surface under lunar gravity on an RTX 3090.
 
 ## Overview
 
-This example creates a 1m × 1m × 0.5m container filled with 50,000 particles simulating lunar regolith behavior under lunar gravity.
+This example creates particles above a 1m × 1m surface that fall under lunar gravity and form a pile/berm. The example uses 50,000 particles by default.
 
 ## Prerequisites
 
@@ -93,11 +93,12 @@ def main():
     print(f"Voxel size: {VOXEL_SIZE:.3f} m")
     print(f"Particle mass: {particle_mass:.6f} kg")
     
-    # Add particles in a grid layout
+    # Add particles in a grid layout - spawn above surface so they fall naturally
+    spawn_height = DOMAIN_Z + 0.5  # 0.5m above ground
     builder.add_particle_grid(
-        pos=wp.vec3(0.0, 0.0, 0.0),
+        pos=wp.vec3(0.0, 0.0, spawn_height),
         rot=wp.quat_identity(),
-        vel=wp.vec3(0.0, 0.0, 0.0),
+        vel=wp.vec3(0.0, 0.0, 0.0),  # Start at rest - let lunar gravity do the work
         dim_x=dim_x + 1,
         dim_y=dim_y + 1,
         dim_z=dim_z + 1,
@@ -120,57 +121,20 @@ def main():
         has_particle_collision=True,
     )
     
-    # Ground plane (floor)
+    # Ground plane only (particles form a pile/berm naturally)
     builder.add_ground_plane(cfg=wall_cfg)
     
-    # Box walls (2cm thick)
-    wall_thickness = 0.02
+    print(f"Added ground plane (open surface - particles will pile/berm)")
     
-    # Back wall (y=0)
-    builder.add_shape_box(
-        body=-1,  # -1 = static world body
-        cfg=wall_cfg,
-        xform=wp.transform(
-            wp.vec3(DOMAIN_X/2, -wall_thickness/2, DOMAIN_Z/2),
-            wp.quat_identity()
-        ),
-        hx=DOMAIN_X/2, hy=wall_thickness/2, hz=DOMAIN_Z/2,
-    )
-    
-    # Front wall (y=DOMAIN_Y)
-    builder.add_shape_box(
-        body=-1,
-        cfg=wall_cfg,
-        xform=wp.transform(
-            wp.vec3(DOMAIN_X/2, DOMAIN_Y + wall_thickness/2, DOMAIN_Z/2),
-            wp.quat_identity()
-        ),
-        hx=DOMAIN_X/2, hy=wall_thickness/2, hz=DOMAIN_Z/2,
-    )
-    
-    # Left wall (x=0)
-    builder.add_shape_box(
-        body=-1,
-        cfg=wall_cfg,
-        xform=wp.transform(
-            wp.vec3(-wall_thickness/2, DOMAIN_Y/2, DOMAIN_Z/2),
-            wp.quat_identity()
-        ),
-        hx=wall_thickness/2, hy=DOMAIN_Y/2, hz=DOMAIN_Z/2,
-    )
-    
-    # Right wall (x=DOMAIN_X)
-    builder.add_shape_box(
-        body=-1,
-        cfg=wall_cfg,
-        xform=wp.transform(
-            wp.vec3(DOMAIN_X + wall_thickness/2, DOMAIN_Y/2, DOMAIN_Z/2),
-            wp.quat_identity()
-        ),
-        hx=wall_thickness/2, hy=DOMAIN_Y/2, hz=DOMAIN_Z/2,
-    )
-    
-    print(f"Added ground + 4 walls")
+    # Optional: Uncomment to add 4 walls for a boxed container
+    # wall_thickness = 0.02
+    # # Back wall (y=0)
+    # builder.add_shape_box(
+    #     body=-1, cfg=wall_cfg,
+    #     xform=wp.transform(wp.vec3(DOMAIN_X/2, -wall_thickness/2, DOMAIN_Z/2), wp.quat_identity()),
+    #     hx=DOMAIN_X/2, hy=wall_thickness/2, hz=DOMAIN_Z/2,
+    # )
+    # # ... add other walls similarly
     
     # -------------------------------------------------------------------------
     # Step 4: Finalize the model
