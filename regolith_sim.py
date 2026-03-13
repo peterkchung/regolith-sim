@@ -320,7 +320,17 @@ class LunarRegolithSimulation:
                 ),
                 mass=5.0,  # 5 kg rocks
             )
-            builder.add_shape_box(body, hx=float(hx), hy=float(hy), hz=float(hz))
+            # Add collision shape with explicit particle collision enabled
+            builder.add_shape_box(
+                body,
+                hx=float(hx),
+                hy=float(hy),
+                hz=float(hz),
+                cfg=newton.ModelBuilder.ShapeConfig(
+                    mu=options.friction,
+                    has_particle_collision=True,  # CRITICAL: Enable particle collision
+                ),
+            )
 
         print(f"  Added {len(rocks)} rigid rocks")
 
