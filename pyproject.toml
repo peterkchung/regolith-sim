@@ -7,6 +7,9 @@ dependencies = [
     "warp-lang[examples]",
     "numpy",
     "newton>=1.0.0",
+    "mujoco-warp>=3.6.0",
+    "imgui-bundle",
+    "glfw",
 ]
 
 [project.optional-dependencies]
