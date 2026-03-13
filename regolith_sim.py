@@ -216,6 +216,13 @@ class LunarRegolithSimulation:
         # Setup colliders from rigid body model (if available)
         if has_rigid_bodies:
             self.mpm_solver.setup_collider(model=self.rb_model)
+            # Debug: Check if colliders are properly set up
+            if hasattr(self.mpm_solver, "collider_body_index"):
+                print(
+                    f"  Colliders set up: {self.mpm_solver.collider_body_index.shape[0]} bodies"
+                )
+            else:
+                print("  WARNING: No collider_body_index found!")
         else:
             # No rigid bodies, just use ground plane collision
             self.collider_body_id = None
@@ -545,12 +552,33 @@ class LunarRegolithSimulation:
         if self.current_frame % 10 == 0 or self.current_frame == 1:
             positions = self.sand_state_0.particle_q.numpy()
             z_positions = positions[:, 2]
-            print(
-                f"Frame {self.current_frame:4d}/{self.total_frames}: "
-                f"z_avg={z_positions.mean():.3f}m, "
-                f"z_min={z_positions.min():.3f}m, "
-                f"z_max={z_positions.max():.3f}m"
-            )
+
+            # Also log rock positions if using rigid bodies
+            if self.has_rigid_bodies:
+                # Get rock z positions from transform
+                rock_transforms = self.rb_state_0.body_q.numpy()
+                rock_z = []
+                for i in range(min(4, rock_transforms.shape[0])):
+                    # Extract z from 4x4 transform matrix (index 14 is z translation)
+                    z = (
+                        rock_transforms[i][2, 3]
+                        if len(rock_transforms[i].shape) > 1
+                        else rock_transforms[i][2]
+                    )
+                    rock_z.append(z)
+
+                print(
+                    f"Frame {self.current_frame:4d}/{self.total_frames}: "
+                    f"sand_z_avg={z_positions.mean():.3f}m, "
+                    f"rocks_z=[{', '.join([f'{z:.2f}' for z in rock_z])}]m"
+                )
+            else:
+                print(
+                    f"Frame {self.current_frame:4d}/{self.total_frames}: "
+                    f"z_avg={z_positions.mean():.3f}m, "
+                    f"z_min={z_positions.min():.3f}m, "
+                    f"z_max={z_positions.max():.3f}m"
+                )
 
     def render(self):
         """Render current state to viewer and export USD if enabled"""
