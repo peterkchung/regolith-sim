@@ -103,29 +103,51 @@ class LunarRegolithSimulation:
         self.target_particles = options.target_particles
         self.voxel_size = options.voxel_size
 
-        # ============================================================
-        # RIGID BODY MODEL (for ground and any dynamic obstacles)
-        # ============================================================
-        rb_builder = newton.ModelBuilder()
-        rb_builder.default_shape_cfg.mu = options.ground_friction
+        # Check if MuJoCo is available
+        self.has_mujoco = False
+        try:
+            import mujoco
 
-        # Add ground plane
-        rb_builder.add_ground_plane(
-            cfg=newton.ModelBuilder.ShapeConfig(mu=options.ground_friction)
-        )
+            self.has_mujoco = True
+        except ImportError:
+            pass
 
-        # Add any rigid bodies (rocks, tools, etc.)
-        if options.add_rigid_bodies:
+        # ============================================================
+        # RIGID BODY MODEL (optional, requires MuJoCo)
+        # ============================================================
+        if self.has_mujoco and options.add_rigid_bodies:
+            rb_builder = newton.ModelBuilder()
+            rb_builder.default_shape_cfg.mu = options.ground_friction
+
+            # Add ground plane
+            rb_builder.add_ground_plane(
+                cfg=newton.ModelBuilder.ShapeConfig(mu=options.ground_friction)
+            )
+
+            # Add any rigid bodies (rocks, tools, etc.)
             self._emit_rigid_bodies(rb_builder, options)
 
-        # Finalize rigid body model
-        self.rb_model = rb_builder.finalize()
-        self.rb_model.set_gravity(options.gravity)
+            # Finalize rigid body model
+            self.rb_model = rb_builder.finalize()
+            self.rb_model.set_gravity(options.gravity)
 
-        # Setup rigid body solver (MuJoCo)
-        self.rb_solver = newton.solvers.SolverMuJoCo(
-            self.rb_model, use_mujoco_contacts=False, njmax=100
-        )
+            # Setup rigid body solver (MuJoCo)
+            self.rb_solver = newton.solvers.SolverMuJoCo(
+                self.rb_model, use_mujoco_contacts=False, njmax=100
+            )
+
+            has_rigid_bodies = True
+            print("  Rigid body solver: MuJoCo (two-way coupling enabled)")
+        else:
+            if options.add_rigid_bodies and not self.has_mujoco:
+                print(
+                    "  Warning: MuJoCo not installed, skipping rigid bodies. "
+                    "Install with: uv add mujoco"
+                )
+            self.rb_model = None
+            self.rb_solver = None
+            has_rigid_bodies = False
+            print("  Rigid body solver: None (MPM-only mode)")
 
         # ============================================================
         # SAND/REGOLITH MODEL (MPM particles)
@@ -142,25 +164,38 @@ class LunarRegolithSimulation:
         self.sand_model = sand_builder.finalize()
         self.sand_model.set_gravity(options.gravity)
 
+        # Initialize sand state (needed regardless of rigid bodies)
+        self.sand_state_0 = self.sand_model.state()
+
         print(f"\nModel finalized:")
-        print(f"  Rigid bodies: {self.rb_model.body_count}")
+        if has_rigid_bodies:
+            print(f"  Rigid bodies: {self.rb_model.body_count}")
+        else:
+            print(f"  Rigid bodies: 0 (MPM-only mode)")
         print(f"  Sand particles: {self.sand_model.particle_count:,}")
         print(f"  Voxel size: {self.voxel_size:.4f} m")
         print(f"  Gravity: {options.gravity}")
 
         # Initialize states
-        self.rb_state_0 = self.rb_model.state()
-        self.rb_state_1 = self.rb_model.state()
-        self.sand_state_0 = self.sand_model.state()
-
-        # Link sand state to rigid body state for two-way coupling
-        self.sand_state_0.body_q = wp.empty_like(self.rb_state_0.body_q)
-        self.sand_state_0.body_qd = wp.empty_like(self.rb_state_0.body_qd)
-        self.sand_state_0.body_f = wp.empty_like(self.rb_state_0.body_f)
-
-        # Controls and contacts
-        self.control = self.rb_model.control()
-        self.contacts = self.rb_model.contacts()
+        if has_rigid_bodies:
+            self.rb_state_0 = self.rb_model.state()
+            self.rb_state_1 = self.rb_model.state()
+            # Link sand state to rigid body state for two-way coupling
+            self.sand_state_0.body_q = wp.empty_like(self.rb_state_0.body_q)
+            self.sand_state_0.body_qd = wp.empty_like(self.rb_state_0.body_qd)
+            self.sand_state_0.body_f = wp.empty_like(self.rb_state_0.body_f)
+            # Controls and contacts
+            self.control = self.rb_model.control()
+            self.contacts = self.rb_model.contacts()
+            device = self.rb_model.device
+            self.has_rigid_bodies = True
+        else:
+            self.rb_state_0 = None
+            self.rb_state_1 = None
+            self.control = None
+            self.contacts = None
+            device = self.sand_model.device
+            self.has_rigid_bodies = False
 
         # Configure MPM solver options (stiff granular material)
         mpm_config = SolverImplicitMPM.Config()
@@ -178,15 +213,22 @@ class LunarRegolithSimulation:
         # Initialize MPM solver
         self.mpm_solver = SolverImplicitMPM(self.sand_model, mpm_config)
 
-        # Setup colliders from rigid body model
-        self.mpm_solver.setup_collider(model=self.rb_model)
+        # Setup colliders from rigid body model (if available)
+        if has_rigid_bodies:
+            self.mpm_solver.setup_collider(model=self.rb_model)
+        else:
+            # No rigid bodies, just use ground plane collision
+            self.collider_body_id = None
 
         # Set per-particle material properties (stiff lunar regolith)
         self._set_material_properties(options)
 
         # Setup viewer
         if viewer:
-            self.viewer.set_model(self.rb_model)  # Show rigid bodies
+            if has_rigid_bodies:
+                self.viewer.set_model(self.rb_model)  # Show rigid bodies
+            else:
+                self.viewer.set_model(self.sand_model)  # Show particles only
             self.viewer.show_particles = True
 
             # Position camera for side view
@@ -202,22 +244,24 @@ class LunarRegolithSimulation:
 
         # Additional buffers for two-way coupling
         max_nodes = 1 << 20
-        self.collider_impulses = wp.zeros(
-            max_nodes, dtype=wp.vec3, device=self.rb_model.device
-        )
-        self.collider_impulse_pos = wp.zeros(
-            max_nodes, dtype=wp.vec3, device=self.rb_model.device
-        )
+        self.collider_impulses = wp.zeros(max_nodes, dtype=wp.vec3, device=device)
+        self.collider_impulse_pos = wp.zeros(max_nodes, dtype=wp.vec3, device=device)
         self.collider_impulse_ids = wp.full(
-            max_nodes, value=-1, dtype=int, device=self.rb_model.device
+            max_nodes, value=-1, dtype=int, device=device
         )
         self._collect_collider_impulses()
 
         # Map from collider index to body index
-        self.collider_body_id = self.mpm_solver.collider_body_index
+        if has_rigid_bodies:
+            self.collider_body_id = self.mpm_solver.collider_body_index
+        else:
+            self.collider_body_id = None
 
-        # Per-body forces from sand
-        self.body_sand_forces = wp.zeros_like(self.rb_state_0.body_f)
+        # Per-body forces from sand (only needed for two-way coupling)
+        if has_rigid_bodies:
+            self.body_sand_forces = wp.zeros_like(self.rb_state_0.body_f)
+        else:
+            self.body_sand_forces = None
 
         # Particle render colors
         self.particle_render_colors = wp.full(
@@ -395,56 +439,57 @@ class LunarRegolithSimulation:
                     print(f"Graph capture failed: {e}")
 
     def _simulate(self):
-        """Run one frame of simulation with two-way coupling"""
+        """Run one frame of simulation with optional two-way coupling"""
         for _ in range(self.sim_substeps):
-            # Clear forces on rigid bodies
-            self.rb_state_0.clear_forces()
+            if self.has_rigid_bodies:
+                # Clear forces on rigid bodies
+                self.rb_state_0.clear_forces()
 
-            # Apply forces from sand to rigid bodies
-            wp.launch(
-                compute_body_forces,
-                dim=self.collider_impulse_ids.shape[0],
-                inputs=[
-                    self.frame_dt,
-                    self.collider_impulse_ids,
-                    self.collider_impulses,
-                    self.collider_impulse_pos,
-                    self.collider_body_id,
-                    self.rb_state_0.body_q,
-                    self.rb_model.body_com,
-                    self.rb_state_0.body_f,
-                ],
-            )
+                # Apply forces from sand to rigid bodies
+                wp.launch(
+                    compute_body_forces,
+                    dim=self.collider_impulse_ids.shape[0],
+                    inputs=[
+                        self.frame_dt,
+                        self.collider_impulse_ids,
+                        self.collider_impulses,
+                        self.collider_impulse_pos,
+                        self.collider_body_id,
+                        self.rb_state_0.body_q,
+                        self.rb_model.body_com,
+                        self.rb_state_0.body_f,
+                    ],
+                )
 
-            # Save applied forces
-            self.body_sand_forces.assign(self.rb_state_0.body_f)
+                # Save applied forces
+                self.body_sand_forces.assign(self.rb_state_0.body_f)
 
-            # Apply external forces via viewer
-            if self.viewer:
-                self.viewer.apply_forces(self.rb_state_0)
+                # Apply external forces via viewer
+                if self.viewer:
+                    self.viewer.apply_forces(self.rb_state_0)
 
-            # Rigid body collision detection
-            self.rb_model.collide(self.rb_state_0, self.contacts)
+                # Rigid body collision detection
+                self.rb_model.collide(self.rb_state_0, self.contacts)
 
-            # Step rigid body solver (MuJoCo)
-            self.rb_solver.step(
-                self.rb_state_0,
-                self.rb_state_1,
-                self.control,
-                self.contacts,
-                self.sim_dt,
-            )
+                # Step rigid body solver (MuJoCo)
+                self.rb_solver.step(
+                    self.rb_state_0,
+                    self.rb_state_1,
+                    self.control,
+                    self.contacts,
+                    self.sim_dt,
+                )
 
-            # Swap rigid body states
-            self.rb_state_0, self.rb_state_1 = self.rb_state_1, self.rb_state_0
+                # Swap rigid body states
+                self.rb_state_0, self.rb_state_1 = self.rb_state_1, self.rb_state_0
 
-            # Simulate sand with updated rigid body positions
+            # Simulate sand (with or without rigid body coupling)
             self._simulate_sand()
 
     def _simulate_sand(self):
-        """Simulate sand particles with two-way coupling"""
+        """Simulate sand particles with optional two-way coupling"""
         # Subtract previously applied impulses from body velocities
-        if self.sand_state_0.body_q is not None:
+        if self.has_rigid_bodies and self.sand_state_0.body_q is not None:
             wp.launch(
                 subtract_body_force,
                 dim=self.sand_state_0.body_q.shape,
@@ -469,8 +514,9 @@ class LunarRegolithSimulation:
             dt=self.frame_dt,
         )
 
-        # Save impulses for next rigid body step
-        self._collect_collider_impulses()
+        # Save impulses for next rigid body step (if using coupling)
+        if self.has_rigid_bodies:
+            self._collect_collider_impulses()
 
     def step(self):
         """Advance simulation by one frame"""
@@ -497,8 +543,11 @@ class LunarRegolithSimulation:
         """Render current state to viewer and export USD if enabled"""
         if self.viewer:
             self.viewer.begin_frame(self.sim_time)
-            self.viewer.log_state(self.rb_state_0)  # Rigid bodies
-            self.viewer.log_contacts(self.contacts, self.rb_state_0)
+
+            # Render rigid bodies (if using two-way coupling)
+            if self.has_rigid_bodies:
+                self.viewer.log_state(self.rb_state_0)
+                self.viewer.log_contacts(self.contacts, self.rb_state_0)
 
             # Render sand particles
             self.viewer.log_points(
@@ -517,7 +566,11 @@ class LunarRegolithSimulation:
                 usd_path = os.path.join(
                     self.output_dir, f"regolith_frame_{self.current_frame:04d}.usd"
                 )
-                newton.usd.export_usd(usd_path, self.rb_model, self.rb_state_0)
+                if self.has_rigid_bodies:
+                    newton.usd.export_usd(usd_path, self.rb_model, self.rb_state_0)
+                else:
+                    # Fallback: export sand model instead
+                    newton.usd.export_usd(usd_path, self.sand_model, self.sand_state_0)
             except:
                 # Fallback: export particle positions as numpy array
                 positions = self.sand_state_0.particle_q.numpy()
