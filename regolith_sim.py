@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Lunar Regolith MPM Simulation using Newton Physics Engine
-Optimized for RTX 3090 with USD export and real-time viewer
+Two-way coupling with rigid bodies, optimized for RTX 3090
+Stiff granular material properties for realistic regolith dynamics
 """
 
 import newton
@@ -14,8 +15,63 @@ import argparse
 from newton.solvers import SolverImplicitMPM
 
 
+@wp.kernel
+def compute_body_forces(
+    dt: float,
+    collider_ids: wp.array(dtype=int),
+    collider_impulses: wp.array(dtype=wp.vec3),
+    collider_impulse_pos: wp.array(dtype=wp.vec3),
+    body_ids: wp.array(dtype=int),
+    body_q: wp.array(dtype=wp.transform),
+    body_com: wp.array(dtype=wp.vec3),
+    body_f: wp.array(dtype=wp.spatial_vector),
+):
+    """Compute forces applied by sand to rigid bodies.
+    Sum the impulses applied on each mpm grid node and convert to
+    forces and torques at the body's center of mass.
+    """
+    i = wp.tid()
+    cid = collider_ids[i]
+    if cid >= 0 and cid < body_ids.shape[0]:
+        body_index = body_ids[cid]
+        if body_index == -1:
+            return
+
+        f_world = collider_impulses[i] / dt
+        X_wb = body_q[body_index]
+        X_com = body_com[body_index]
+        r = collider_impulse_pos[i] - wp.transform_point(X_wb, X_com)
+        tau = wp.cross(r, f_world)
+        # spatial_vector takes (angular, linear) = (torque, force)
+        wp.atomic_add(body_f, body_index, wp.spatial_vector(tau, f_world))
+
+
+@wp.kernel
+def subtract_body_force(
+    dt: float,
+    body_q: wp.array(dtype=wp.transform),
+    body_qd: wp.array(dtype=wp.spatial_vector),
+    body_f: wp.array(dtype=wp.spatial_vector),
+    body_inv_inertia: wp.array(dtype=wp.mat33),
+    body_inv_mass: wp.array(dtype=float),
+    body_q_res: wp.array(dtype=wp.transform),
+    body_qd_res: wp.array(dtype=wp.spatial_vector),
+):
+    """Update the rigid bodies velocity to remove the forces applied by sand at the last step."""
+    body_id = wp.tid()
+    # Remove previously applied force
+    f = body_f[body_id]
+    delta_v = dt * body_inv_mass[body_id] * wp.spatial_top(f)
+    r = wp.transform_get_rotation(body_q[body_id])
+    delta_w = dt * wp.quat_rotate(
+        r, body_inv_inertia[body_id] * wp.quat_rotate_inv(r, wp.spatial_bottom(f))
+    )
+    body_q_res[body_id] = body_q[body_id]
+    body_qd_res[body_id] = body_qd[body_id] - wp.spatial_vector(delta_v, delta_w)
+
+
 class LunarRegolithSimulation:
-    """Lunar regolith MPM simulation using Newton's implicit MPM solver"""
+    """Lunar regolith MPM simulation with two-way rigid body coupling"""
 
     def __init__(self, viewer, options):
         """Initialize the simulation with viewer and options"""
@@ -47,307 +103,388 @@ class LunarRegolithSimulation:
         self.target_particles = options.target_particles
         self.voxel_size = options.voxel_size
 
-        # Create builder
-        builder = newton.ModelBuilder()
+        # ============================================================
+        # RIGID BODY MODEL (for ground and any dynamic obstacles)
+        # ============================================================
+        rb_builder = newton.ModelBuilder()
+        rb_builder.default_shape_cfg.mu = options.ground_friction
+
+        # Add ground plane
+        rb_builder.add_ground_plane(
+            cfg=newton.ModelBuilder.ShapeConfig(mu=options.ground_friction)
+        )
+
+        # Add any rigid bodies (rocks, tools, etc.)
+        if options.add_rigid_bodies:
+            self._emit_rigid_bodies(rb_builder, options)
+
+        # Finalize rigid body model
+        self.rb_model = rb_builder.finalize()
+        self.rb_model.set_gravity(options.gravity)
+
+        # Setup rigid body solver (MuJoCo)
+        self.rb_solver = newton.solvers.SolverMuJoCo(
+            self.rb_model, use_mujoco_contacts=False, njmax=100
+        )
+
+        # ============================================================
+        # SAND/REGOLITH MODEL (MPM particles)
+        # ============================================================
+        sand_builder = newton.ModelBuilder()
 
         # Register MPM custom attributes (CRITICAL: before adding particles)
-        SolverImplicitMPM.register_custom_attributes(builder)
+        SolverImplicitMPM.register_custom_attributes(sand_builder)
 
-        # Emit particles
-        self.emit_particles(builder, options)
+        # Emit regolith particles
+        self._emit_regolith(sand_builder, options)
 
-        # Add container boundaries
-        self.add_container(builder, options)
-
-        # Finalize model
-        self.model = builder.finalize()
-        self.model.set_gravity(options.gravity)
+        # Finalize sand model
+        self.sand_model = sand_builder.finalize()
+        self.sand_model.set_gravity(options.gravity)
 
         print(f"\nModel finalized:")
-        print(f"  Particles: {self.model.particle_count:,}")
+        print(f"  Rigid bodies: {self.rb_model.body_count}")
+        print(f"  Sand particles: {self.sand_model.particle_count:,}")
         print(f"  Voxel size: {self.voxel_size:.4f} m")
         print(f"  Gravity: {options.gravity}")
 
         # Initialize states
-        self.state_0 = self.model.state()
-        self.state_1 = self.model.state()
+        self.rb_state_0 = self.rb_model.state()
+        self.rb_state_1 = self.rb_model.state()
+        self.sand_state_0 = self.sand_model.state()
 
-        # Configure MPM solver options
+        # Link sand state to rigid body state for two-way coupling
+        self.sand_state_0.body_q = wp.empty_like(self.rb_state_0.body_q)
+        self.sand_state_0.body_qd = wp.empty_like(self.rb_state_0.body_qd)
+        self.sand_state_0.body_f = wp.empty_like(self.rb_state_0.body_f)
+
+        # Controls and contacts
+        self.control = self.rb_model.control()
+        self.contacts = self.rb_model.contacts()
+
+        # Configure MPM solver options (stiff granular material)
         mpm_config = SolverImplicitMPM.Config()
         mpm_config.voxel_size = self.voxel_size
         mpm_config.max_iterations = options.max_iterations
-        mpm_config.tolerance = options.tolerance
+        mpm_config.tolerance = options.tolerance  # Tight tolerance for accuracy
         mpm_config.strain_basis = options.strain_basis
         mpm_config.solver = options.solver
-        mpm_config.transfer_scheme = options.transfer_scheme
+        mpm_config.transfer_scheme = options.transfer_scheme  # APIC for less diffusion
         mpm_config.grid_type = options.grid_type
         mpm_config.grid_padding = options.grid_padding
         mpm_config.critical_fraction = options.critical_fraction
         mpm_config.air_drag = options.air_drag
 
         # Initialize MPM solver
-        self.solver = SolverImplicitMPM(self.model, mpm_config)
+        self.mpm_solver = SolverImplicitMPM(self.sand_model, mpm_config)
 
-        # Set per-particle material properties via model.mpm
-        self.set_material_properties(options)
+        # Setup colliders from rigid body model
+        self.mpm_solver.setup_collider(model=self.rb_model)
+
+        # Set per-particle material properties (stiff lunar regolith)
+        self._set_material_properties(options)
 
         # Setup viewer
         if viewer:
-            self.viewer.set_model(self.model)
+            self.viewer.set_model(self.rb_model)  # Show rigid bodies
             self.viewer.show_particles = True
 
-            # Position camera for 45° side view facing the spawn point
-            # Camera positioned to the side of the domain, looking toward the center
+            # Position camera for side view
             camera_distance = max(self.domain_x, self.domain_y) * 2.0
             camera_pos = wp.vec3(
-                self.domain_x / 2 + camera_distance,  # To the side in +X
-                self.domain_y / 2,  # Center Y
-                self.domain_z * 2.5,  # Height to see spawn and pile
+                self.domain_x / 2 + camera_distance,
+                self.domain_y / 2,
+                self.domain_z * 2.5,
             )
 
-            # Camera looks toward the center (yaw=180° to look along -X toward center)
             if hasattr(self.viewer, "set_camera"):
                 self.viewer.set_camera(camera_pos, pitch=-35.0, yaw=180.0)
-                print(
-                    f"\nCamera positioned at ({camera_pos[0]:.2f}, {camera_pos[1]:.2f}, {camera_pos[2]:.2f}) "
-                    f"looking toward spawn point at center"
-                )
+
+        # Additional buffers for two-way coupling
+        max_nodes = 1 << 20
+        self.collider_impulses = wp.zeros(
+            max_nodes, dtype=wp.vec3, device=self.rb_model.device
+        )
+        self.collider_impulse_pos = wp.zeros(
+            max_nodes, dtype=wp.vec3, device=self.rb_model.device
+        )
+        self.collider_impulse_ids = wp.full(
+            max_nodes, value=-1, dtype=int, device=self.rb_model.device
+        )
+        self._collect_collider_impulses()
+
+        # Map from collider index to body index
+        self.collider_body_id = self.mpm_solver.collider_body_index
+
+        # Per-body forces from sand
+        self.body_sand_forces = wp.zeros_like(self.rb_state_0.body_f)
+
+        # Particle render colors
+        self.particle_render_colors = wp.full(
+            self.sand_model.particle_count,
+            value=wp.vec3(0.7, 0.6, 0.4),  # Sandy color
+            dtype=wp.vec3,
+            device=self.sand_model.device,
+        )
 
         # Try to capture CUDA graph for faster simulation
-        self.capture()
+        self._capture()
 
         print("\n" + "=" * 60)
         print("Simulation initialized successfully!")
+        print("Two-way coupling enabled: rigid bodies <-> regolith")
         print("=" * 60)
 
-    def emit_particles(self, builder, options):
-        """Create particle grid for regolith falling into container"""
+    def _emit_rigid_bodies(self, builder, options):
+        """Add rigid bodies (rocks, tools) that interact with regolith"""
+
+        # Drop some rocks into the sand bed
+        drop_z = self.domain_z * 1.5
+        offsets_xy = [
+            (0.1, 0.0),
+            (-0.1, 0.0),
+            (0.0, 0.1),
+            (0.0, -0.1),
+            (0.15, 0.15),
+            (-0.15, -0.15),
+        ]
+
+        z_separation = 0.3
+
+        # Add various sized rocks
+        rocks = [
+            (0.08, 0.06, 0.05),  # Small rock
+            (0.10, 0.08, 0.06),  # Medium rock
+            (0.06, 0.05, 0.04),  # Small rock
+            (0.12, 0.10, 0.08),  # Large rock
+        ]
+
+        for i, rock in enumerate(rocks):
+            (hx, hy, hz) = rock
+            ox, oy = offsets_xy[i % len(offsets_xy)]
+            pz = drop_z + float(i) * z_separation
+
+            body = builder.add_body(
+                xform=wp.transform(
+                    p=wp.vec3(
+                        self.domain_x / 2 + float(ox), self.domain_y / 2 + float(oy), pz
+                    ),
+                    q=wp.normalize(wp.quatf(0.0, 0.0, 0.0, 1.0)),
+                ),
+                mass=5.0,  # 5 kg rocks
+            )
+            builder.add_shape_box(body, hx=float(hx), hy=float(hy), hz=float(hz))
+
+        print(f"  Added {len(rocks)} rigid rocks")
+
+    def _emit_regolith(self, builder, options):
+        """Create regolith particle bed with proper granular structure"""
 
         density = options.density
         particles_per_cell = 3
 
-        # Spawn particles in a funnel above the center of the container
-        # Narrow spawn area (25% of domain width) positioned higher for dramatic pour effect
-        funnel_width_factor = 0.25  # Spawn region is 25% of domain width
-        spawn_height = self.domain_z * 2.5  # 2.5x the domain height above ground
-
-        # Calculate grid dimensions for the NARROW spawn region
-        # This maintains proper cell aspect ratios for MPM physics
-        funnel_domain_x = self.domain_x * funnel_width_factor
-        funnel_domain_y = self.domain_y * funnel_width_factor
-
-        total_cells = self.target_particles / particles_per_cell
-        cells_per_side = int(np.cbrt(total_cells))
-
-        # Calculate dimensions for the narrow funnel region
-        aspect_xy = funnel_domain_x / funnel_domain_y
-        aspect_xz = funnel_domain_x / self.domain_z
-
-        dim_x_funnel = int(cells_per_side * np.cbrt(aspect_xy * aspect_xz))
-        dim_y_funnel = int(cells_per_side * np.cbrt(1.0 / aspect_xy))
-        dim_z_funnel = int(cells_per_side * np.cbrt(1.0 / aspect_xz))
-
-        # Calculate cell sizes for the funnel (maintaining proper aspect ratios)
-        cell_size_x_funnel = funnel_domain_x / dim_x_funnel
-        cell_size_y_funnel = funnel_domain_y / dim_y_funnel
-        cell_size_z_funnel = self.domain_z / dim_z_funnel
-        cell_volume_funnel = (
-            cell_size_x_funnel * cell_size_y_funnel * cell_size_z_funnel
+        # Spawn particles in a block above the ground
+        bed_lo = np.array(
+            [
+                self.domain_x / 2 - options.bed_width / 2,
+                self.domain_y / 2 - options.bed_depth / 2,
+                0.0,
+            ]
+        )
+        bed_hi = np.array(
+            [
+                self.domain_x / 2 + options.bed_width / 2,
+                self.domain_y / 2 + options.bed_depth / 2,
+                options.bed_height,
+            ]
         )
 
-        # Recalculate voxel size and mass for funnel
-        self.voxel_size = min(
-            cell_size_x_funnel, cell_size_y_funnel, cell_size_z_funnel
+        # Calculate grid resolution
+        bed_res = np.array(
+            np.ceil(particles_per_cell * (bed_hi - bed_lo) / self.voxel_size),
+            dtype=int,
         )
-        radius_funnel = (
-            max(cell_size_x_funnel, cell_size_y_funnel, cell_size_z_funnel) * 0.5
-        )
-        mass_funnel = cell_volume_funnel * density
 
-        print(f"\nPour particle grid:")
-        print(f"  Stream dimensions: narrow column for pouring effect")
+        cell_size = (bed_hi - bed_lo) / bed_res
+        cell_volume = np.prod(cell_size)
+        radius = float(np.max(cell_size) * 0.5)
+        mass = float(cell_volume * density)
+
+        print(f"\nRegolith particle bed:")
+        print(
+            f"  Dimensions: {options.bed_width:.2f}m x {options.bed_depth:.2f}m x {options.bed_height:.2f}m"
+        )
+        print(f"  Grid resolution: {bed_res[0]} x {bed_res[1]} x {bed_res[2]}")
+        print(
+            f"  Cell size: {cell_size[0]:.3f} x {cell_size[1]:.3f} x {cell_size[2]:.3f} m"
+        )
         print(f"  Target particles: {self.target_particles:,}")
-        print(f"  Base spawn height: {spawn_height:.2f}m above ground")
 
-        # Center the spawn region above the container
-        spawn_center_x = self.domain_x / 2
-        spawn_center_y = self.domain_y / 2
-
-        # POUR SPAWN: Create a narrow stream that pours down like from a funnel
-        # Instead of multiple clusters, create one continuous column with extreme randomness
-
-        # Narrow stream dimensions - like a funnel pouring
-        stream_width_factor = 0.15  # 15% of domain - narrow stream
-        stream_domain_x = self.domain_x * stream_width_factor
-        stream_domain_y = self.domain_y * stream_width_factor
-
-        # Calculate cell count for the stream to achieve target particles
-        # Make it tall and narrow
-        stream_cells_total = self.target_particles / particles_per_cell
-        stream_cells_z = int(np.cbrt(stream_cells_total) * 2.5)  # Extra tall
-        stream_cells_xy = int(np.sqrt(stream_cells_total / stream_cells_z))
-
-        stream_dim_x = max(3, stream_cells_xy)
-        stream_dim_y = max(3, stream_cells_xy)
-        stream_dim_z = max(20, stream_cells_z)  # At least 20 layers tall
-
-        # Cell sizes for the narrow stream
-        stream_cell_x = stream_domain_x / stream_dim_x
-        stream_cell_y = stream_domain_y / stream_dim_y
-        stream_cell_z = (self.domain_z * 3) / stream_dim_z  # Stretch vertically
-
-        print(f"\n  Pour spawn: narrow stream")
-        print(
-            f"  Stream: {stream_domain_x:.2f}m x {stream_domain_y:.2f}m x {self.domain_z * 3:.2f}m"
-        )
-        print(f"  Grid: {stream_dim_x} x {stream_dim_y} x {stream_dim_z}")
-
-        total_particles_spawned = 0
-
-        # Create ONE continuous stream above the tile center
-        # Center it over the small tile
-        stream_center_x = self.domain_x / 2
-        stream_center_y = self.domain_y / 2
-        stream_base_height = spawn_height
-
-        # Use maximum jitter to break up the grid into a fluid-like mass
         builder.add_particle_grid(
-            pos=wp.vec3(
-                stream_center_x - stream_domain_x / 2,
-                stream_center_y - stream_domain_y / 2,
-                stream_base_height,
-            ),
+            pos=wp.vec3(bed_lo),
             rot=wp.quat_identity(),
-            vel=wp.vec3(0.0, 0.0, 0.0),  # Start at rest - pure gravity fall
-            dim_x=stream_dim_x,
-            dim_y=stream_dim_y,
-            dim_z=stream_dim_z,
-            cell_x=stream_cell_x,
-            cell_y=stream_cell_y,
-            cell_z=stream_cell_z,
-            mass=mass_funnel,
-            jitter=8.0 * radius_funnel,  # EXTREME jitter for fluid-like appearance
-            radius_mean=radius_funnel,
-            flags=newton.ParticleFlags.ACTIVE,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=bed_res[0] + 1,
+            dim_y=bed_res[1] + 1,
+            dim_z=bed_res[2] + 1,
+            cell_x=cell_size[0],
+            cell_y=cell_size[1],
+            cell_z=cell_size[2],
+            mass=mass,
+            jitter=2.0 * radius,  # Moderate jitter (like granular example)
+            radius_mean=radius,
+            custom_attributes={"mpm:friction": options.friction},
         )
 
-        stream_particles = stream_dim_x * stream_dim_y * stream_dim_z
-        total_particles_spawned = stream_particles
+    def _set_material_properties(self, options):
+        """Set per-particle material properties for stiff granular regolith"""
 
-        print(f"  Total particles spawned: {total_particles_spawned:,}")
-        print(
-            f"  Stream height: {stream_base_height:.2f}m to {stream_base_height + stream_dim_z * stream_cell_z:.2f}m"
-        )
-        print(f"  Pouring onto small tile - will pile up and spill over")
-
-    def add_container(self, builder, options):
-        """Add rigid container boundaries"""
-
-        # Container collision properties
-        container_cfg = newton.ModelBuilder.ShapeConfig(
-            mu=options.friction,
-            density=0.0,  # Static
-            has_particle_collision=True,
-        )
-
-        wall_thickness = 0.02  # 2cm
-
-        # Make floor tile smaller than spawn area so regolith falls off edges
-        # Floor is 50% of domain size, centered under spawn
-        floor_scale = 0.5
-        floor_half_x = self.domain_x * floor_scale / 2
-        floor_half_y = self.domain_y * floor_scale / 2
-
-        # Ground plane as explicit collision box - smaller than spawn
-        builder.add_shape_box(
-            body=-1,
-            cfg=container_cfg,
-            xform=wp.transform(
-                wp.vec3(self.domain_x / 2, self.domain_y / 2, -wall_thickness / 2),
-                wp.quat_identity(),
-            ),
-            hx=floor_half_x,
-            hy=floor_half_y,
-            hz=wall_thickness / 2,
-        )
-
-        print(f"\nContainer:")
-        print(f"  Ground: small collision box ({floor_scale * 100:.0f}% of domain)")
-        print(f"  Size: {floor_half_x * 2:.2f}m x {floor_half_y * 2:.2f}m")
-        print(f"  Regolith will pile on tile and spill over edges")
-
-        if options.walled_container:
-            print(f"  Ground + 4 walls (boxed)")
-            print(f"  Wall thickness: {wall_thickness * 100:.1f} cm")
-        else:
-            print(f"  Ground box (open - pile formation)")
-            print(f"  Regolith will spread and pile naturally")
-
-    def set_material_properties(self, options):
-        """Set per-particle material properties for lunar regolith"""
-
-        num_particles = self.model.particle_count
+        num_particles = self.sand_model.particle_count
 
         # Create index array for all particles
         indices = wp.array(
-            np.arange(num_particles), dtype=int, device=self.model.device
+            np.arange(num_particles), dtype=int, device=self.sand_model.device
         )
 
-        # Set material properties via model.mpm namespace
-        self.model.mpm.young_modulus[indices].fill_(options.young_modulus)
-        self.model.mpm.poisson_ratio[indices].fill_(options.poisson_ratio)
-        self.model.mpm.friction[indices].fill_(options.friction)
-        self.model.mpm.yield_pressure[indices].fill_(options.yield_pressure)
-        self.model.mpm.yield_stress[indices].fill_(options.yield_stress)
-        self.model.mpm.tensile_yield_ratio[indices].fill_(options.tensile_yield_ratio)
-        self.model.mpm.hardening[indices].fill_(options.hardening)
-        self.model.mpm.damping[indices].fill_(options.damping)
+        # Set stiff granular material properties
+        self.sand_model.mpm.young_modulus[indices].fill_(options.young_modulus)
+        self.sand_model.mpm.poisson_ratio[indices].fill_(options.poisson_ratio)
+        self.sand_model.mpm.friction[indices].fill_(options.friction)
+        self.sand_model.mpm.yield_pressure[indices].fill_(options.yield_pressure)
+        self.sand_model.mpm.yield_stress[indices].fill_(options.yield_stress)
+        self.sand_model.mpm.tensile_yield_ratio[indices].fill_(
+            options.tensile_yield_ratio
+        )
+        self.sand_model.mpm.hardening[indices].fill_(options.hardening)
+        self.sand_model.mpm.damping[indices].fill_(options.damping)
 
-        print(f"\nMaterial properties (lunar regolith):")
-        print(f"  Young's modulus: {options.young_modulus / 1e6:.1f} MPa")
+        print(f"\nMaterial properties (stiff granular regolith):")
+        print(f"  Young's modulus: {options.young_modulus:.1e} Pa")
         print(f"  Poisson ratio: {options.poisson_ratio:.2f}")
         print(
             f"  Friction: {options.friction:.2f} (~{np.degrees(np.arctan(options.friction)):.1f}°)"
         )
-        print(f"  Yield pressure: {options.yield_pressure / 1e3:.1f} kPa")
+        print(f"  Yield pressure: {options.yield_pressure:.1e} Pa")
         print(f"  Density: {options.density:.0f} kg/m³")
+        print(f"  Transfer scheme: {options.transfer_scheme.upper()}")
 
-    def capture(self):
+    def _collect_collider_impulses(self):
+        """Collect impulses from sand colliders for two-way coupling"""
+        impulses, pos, ids = self.mpm_solver._collect_collider_impulses(
+            self.sand_state_0
+        )
+        self.collider_impulse_ids.fill_(-1)
+        n_colliders = min(impulses.shape[0], self.collider_impulses.shape[0])
+        self.collider_impulses[:n_colliders].assign(impulses[:n_colliders])
+        self.collider_impulse_pos[:n_colliders].assign(pos[:n_colliders])
+        self.collider_impulse_ids[:n_colliders].assign(ids[:n_colliders])
+
+    def _capture(self):
         """Capture CUDA graph for faster simulation"""
         self.graph = None
-        if wp.get_device().is_cuda and self.solver.grid_type == "fixed":
+        if wp.get_device().is_cuda and self.mpm_solver.grid_type == "fixed":
             if self.sim_substeps % 2 != 0:
                 wp.utils.warn("Sim substeps must be even for graph capture of MPM step")
             else:
                 try:
                     with wp.ScopedCapture() as capture:
-                        self.simulate()
+                        self._simulate()
                     self.graph = capture.graph
                     print("CUDA graph captured (optimized)")
                 except Exception as e:
                     print(f"Graph capture failed: {e}")
 
-    def simulate(self):
-        """Run one frame of simulation with substeps"""
+    def _simulate(self):
+        """Run one frame of simulation with two-way coupling"""
         for _ in range(self.sim_substeps):
-            self.state_0.clear_forces()
-            self.solver.step(self.state_0, self.state_1, None, None, self.sim_dt)
-            self.solver._project_outside(self.state_1, self.state_1, self.sim_dt)
-            self.state_0, self.state_1 = self.state_1, self.state_0
+            # Clear forces on rigid bodies
+            self.rb_state_0.clear_forces()
+
+            # Apply forces from sand to rigid bodies
+            wp.launch(
+                compute_body_forces,
+                dim=self.collider_impulse_ids.shape[0],
+                inputs=[
+                    self.frame_dt,
+                    self.collider_impulse_ids,
+                    self.collider_impulses,
+                    self.collider_impulse_pos,
+                    self.collider_body_id,
+                    self.rb_state_0.body_q,
+                    self.rb_model.body_com,
+                    self.rb_state_0.body_f,
+                ],
+            )
+
+            # Save applied forces
+            self.body_sand_forces.assign(self.rb_state_0.body_f)
+
+            # Apply external forces via viewer
+            if self.viewer:
+                self.viewer.apply_forces(self.rb_state_0)
+
+            # Rigid body collision detection
+            self.rb_model.collide(self.rb_state_0, self.contacts)
+
+            # Step rigid body solver (MuJoCo)
+            self.rb_solver.step(
+                self.rb_state_0,
+                self.rb_state_1,
+                self.control,
+                self.contacts,
+                self.sim_dt,
+            )
+
+            # Swap rigid body states
+            self.rb_state_0, self.rb_state_1 = self.rb_state_1, self.rb_state_0
+
+            # Simulate sand with updated rigid body positions
+            self._simulate_sand()
+
+    def _simulate_sand(self):
+        """Simulate sand particles with two-way coupling"""
+        # Subtract previously applied impulses from body velocities
+        if self.sand_state_0.body_q is not None:
+            wp.launch(
+                subtract_body_force,
+                dim=self.sand_state_0.body_q.shape,
+                inputs=[
+                    self.frame_dt,
+                    self.rb_state_0.body_q,
+                    self.rb_state_0.body_qd,
+                    self.body_sand_forces,
+                    self.rb_model.body_inv_inertia,
+                    self.rb_model.body_inv_mass,
+                    self.sand_state_0.body_q,
+                    self.sand_state_0.body_qd,
+                ],
+            )
+
+        # Step MPM solver
+        self.mpm_solver.step(
+            self.sand_state_0,
+            self.sand_state_0,
+            contacts=None,
+            control=None,
+            dt=self.frame_dt,
+        )
+
+        # Save impulses for next rigid body step
+        self._collect_collider_impulses()
 
     def step(self):
         """Advance simulation by one frame"""
         if self.graph:
             wp.capture_launch(self.graph)
         else:
-            self.simulate()
+            self._simulate()
 
         self.sim_time += self.frame_dt
         self.current_frame += 1
 
         # Progress logging
         if self.current_frame % 10 == 0 or self.current_frame == 1:
-            positions = self.state_0.particle_q.numpy()
+            positions = self.sand_state_0.particle_q.numpy()
             z_positions = positions[:, 2]
             print(
                 f"Frame {self.current_frame:4d}/{self.total_frames}: "
@@ -360,20 +497,30 @@ class LunarRegolithSimulation:
         """Render current state to viewer and export USD if enabled"""
         if self.viewer:
             self.viewer.begin_frame(self.sim_time)
-            self.viewer.log_state(self.state_0)
+            self.viewer.log_state(self.rb_state_0)  # Rigid bodies
+            self.viewer.log_contacts(self.contacts, self.rb_state_0)
+
+            # Render sand particles
+            self.viewer.log_points(
+                "/sand",
+                points=self.sand_state_0.particle_q,
+                radii=self.sand_model.particle_radius,
+                colors=self.particle_render_colors,
+                hidden=not self.viewer.show_particles,
+            )
+
             self.viewer.end_frame()
 
         # Export USD
         if self.export_usd and self.current_frame % self.export_every_n_frames == 0:
             try:
-                # Try to use Newton's USD export if available
                 usd_path = os.path.join(
                     self.output_dir, f"regolith_frame_{self.current_frame:04d}.usd"
                 )
-                newton.usd.export_usd(usd_path, self.model, self.state_0)
+                newton.usd.export_usd(usd_path, self.rb_model, self.rb_state_0)
             except:
                 # Fallback: export particle positions as numpy array
-                positions = self.state_0.particle_q.numpy()
+                positions = self.sand_state_0.particle_q.numpy()
                 npy_path = os.path.join(
                     self.output_dir, f"frame_{self.current_frame:04d}.npy"
                 )
@@ -391,23 +538,18 @@ def main():
     parser = newton.examples.create_parser()
 
     # Scene configuration
-    parser.add_argument("--domain-x", type=float, default=1.0, help="Domain size X (m)")
-    parser.add_argument("--domain-y", type=float, default=1.0, help="Domain size Y (m)")
-    parser.add_argument("--domain-z", type=float, default=0.5, help="Domain size Z (m)")
-    parser.add_argument(
-        "--walled-container",
-        action="store_true",
-        help="Use 4-wall container (default is open ground for berming)",
-    )
+    parser.add_argument("--domain-x", type=float, default=2.0, help="Domain size X (m)")
+    parser.add_argument("--domain-y", type=float, default=2.0, help="Domain size Y (m)")
+    parser.add_argument("--domain-z", type=float, default=1.0, help="Domain size Z (m)")
     parser.add_argument(
         "--target-particles", type=int, default=100000, help="Target particle count"
     )
     parser.add_argument(
         "--total-frames", type=int, default=1000, help="Total simulation frames"
     )
-    parser.add_argument("--fps", type=float, default=30.0, help="Output frame rate")
+    parser.add_argument("--fps", type=float, default=60.0, help="Output frame rate")
     parser.add_argument(
-        "--substeps", type=int, default=10, help="Physics substeps per frame"
+        "--substeps", type=int, default=4, help="Physics substeps per frame"
     )
     parser.add_argument(
         "--gravity",
@@ -417,52 +559,103 @@ def main():
         help="Gravity vector (m/s²)",
     )
 
-    # Material properties (lunar regolith defaults)
+    # Bed dimensions
+    parser.add_argument(
+        "--bed-width", type=float, default=1.0, help="Sand bed width (m)"
+    )
+    parser.add_argument(
+        "--bed-depth", type=float, default=1.0, help="Sand bed depth (m)"
+    )
+    parser.add_argument(
+        "--bed-height", type=float, default=0.5, help="Sand bed height (m)"
+    )
+
+    # Rigid body options
+    parser.add_argument(
+        "--add-rigid-bodies", action="store_true", help="Add rigid rocks/bodies"
+    )
+    parser.add_argument(
+        "--ground-friction", type=float, default=0.5, help="Ground friction"
+    )
+
+    # Material properties (STIFF GRANULAR - like the example_mpm_granular.py)
     parser.add_argument(
         "--density", type=float, default=1500.0, help="Material density (kg/m³)"
     )
     parser.add_argument(
-        "--young-modulus", type=float, default=10e6, help="Young's modulus (Pa)"
+        "--young-modulus",
+        type=float,
+        default=1.0e15,  # Very stiff like the granular example
+        help="Young's modulus (Pa)",
     )
     parser.add_argument(
-        "--poisson-ratio", type=float, default=0.3, help="Poisson's ratio"
+        "--poisson-ratio",
+        type=float,
+        default=0.3,  # Like the granular example
+        help="Poisson's ratio",
     )
     parser.add_argument(
-        "--friction", type=float, default=0.85, help="Friction coefficient"
+        "--friction",
+        type=float,
+        default=0.68,  # Higher friction like the granular example (~34°)
+        help="Friction coefficient",
     )
     parser.add_argument(
-        "--yield-pressure", type=float, default=5e3, help="Yield pressure (Pa)"
+        "--yield-pressure",
+        type=float,
+        default=1.0e12,  # Very high like the granular example
+        help="Yield pressure (Pa)",
     )
     parser.add_argument(
-        "--yield-stress", type=float, default=1e3, help="Yield stress (Pa)"
+        "--yield-stress", type=float, default=0.0, help="Yield stress (Pa)"
     )
     parser.add_argument(
-        "--tensile-yield-ratio", type=float, default=0.1, help="Tensile yield ratio"
+        "--tensile-yield-ratio",
+        type=float,
+        default=0.0,
+        help="Tensile yield ratio (0 for dry sand)",
     )
-    parser.add_argument("--hardening", type=float, default=5.0, help="Hardening factor")
-    parser.add_argument("--damping", type=float, default=0.05, help="Viscous damping")
+    parser.add_argument(
+        "--hardening",
+        type=float,
+        default=0.0,
+        help="Hardening factor (0 for loose sand)",
+    )
+    parser.add_argument(
+        "--damping",
+        type=float,
+        default=0.0,
+        help="Viscous damping",
+    )
 
-    # Solver configuration
+    # Solver configuration (matching granular example)
     parser.add_argument(
-        "--voxel-size", type=float, default=0.02, help="Grid voxel size (m)"
+        "--voxel-size", type=float, default=0.05, help="Grid voxel size (m)"
     )
     parser.add_argument(
-        "--grid-type", type=str, default="sparse", choices=["sparse", "fixed", "dense"]
+        "--grid-type", type=str, default="fixed", choices=["sparse", "fixed", "dense"]
     )
     parser.add_argument(
         "--solver", type=str, default="gauss-seidel", choices=["gauss-seidel", "jacobi"]
     )
     parser.add_argument(
-        "--transfer-scheme", type=str, default="apic", choices=["apic", "pic"]
+        "--transfer-scheme",
+        type=str,
+        default="apic",  # APIC for less diffusion (like granular example)
+        choices=["apic", "pic"],
+        help="Particle transfer scheme",
     )
     parser.add_argument("--strain-basis", type=str, default="P0", choices=["P0", "Q1"])
     parser.add_argument(
-        "--max-iterations", type=int, default=250, help="Solver max iterations"
+        "--max-iterations", type=int, default=50, help="Solver max iterations"
     )
     parser.add_argument(
-        "--tolerance", type=float, default=1e-5, help="Solver tolerance"
+        "--tolerance",
+        type=float,
+        default=1.0e-6,  # Tight tolerance like granular example
+        help="Solver tolerance",
     )
-    parser.add_argument("--grid-padding", type=int, default=0, help="Grid padding")
+    parser.add_argument("--grid-padding", type=int, default=50, help="Grid padding")
     parser.add_argument(
         "--critical-fraction", type=float, default=0.0, help="Critical fraction"
     )
