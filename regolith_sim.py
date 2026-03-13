@@ -96,23 +96,21 @@ class LunarRegolithSimulation:
             self.viewer.set_model(self.model)
             self.viewer.show_particles = True
 
-            # Position camera above the container looking down
-            # Container center is at (domain_x/2, domain_y/2, domain_z/2)
-            # Position camera above looking down at -90 degrees pitch (straight down)
-            camera_height = (
-                max(self.domain_x, self.domain_y) * 1.5
-            )  # 1.5x the domain size above
+            # Position camera for 45° side view facing the spawn point
+            # Camera positioned to the side of the domain, looking toward the center
+            camera_distance = max(self.domain_x, self.domain_y) * 2.0
             camera_pos = wp.vec3(
-                self.domain_x / 2,  # Center X
+                self.domain_x / 2 + camera_distance,  # To the side in +X
                 self.domain_y / 2,  # Center Y
-                self.domain_z + camera_height,  # Above container
+                self.domain_z * 2.5,  # Height to see spawn and pile
             )
 
-            # Set camera looking straight down (-90 pitch, 0 yaw)
+            # Camera looks toward the center (yaw=180° to look along -X toward center)
             if hasattr(self.viewer, "set_camera"):
-                self.viewer.set_camera(camera_pos, pitch=-90.0, yaw=0.0)
+                self.viewer.set_camera(camera_pos, pitch=-35.0, yaw=180.0)
                 print(
-                    f"\nCamera positioned at ({camera_pos[0]:.2f}, {camera_pos[1]:.2f}, {camera_pos[2]:.2f}) looking down"
+                    f"\nCamera positioned at ({camera_pos[0]:.2f}, {camera_pos[1]:.2f}, {camera_pos[2]:.2f}) "
+                    f"looking toward spawn point at center"
                 )
 
         # Try to capture CUDA graph for faster simulation
@@ -126,68 +124,121 @@ class LunarRegolithSimulation:
         """Create particle grid for regolith falling into container"""
 
         density = options.density
-        voxel_size = self.voxel_size
         particles_per_cell = 3
 
-        # Calculate grid dimensions to achieve target particle count
+        # Spawn particles in a funnel above the center of the container
+        # Narrow spawn area (25% of domain width) positioned higher for dramatic pour effect
+        funnel_width_factor = 0.25  # Spawn region is 25% of domain width
+        spawn_height = self.domain_z * 2.5  # 2.5x the domain height above ground
+
+        # Calculate grid dimensions for the NARROW spawn region
+        # This maintains proper cell aspect ratios for MPM physics
+        funnel_domain_x = self.domain_x * funnel_width_factor
+        funnel_domain_y = self.domain_y * funnel_width_factor
+
         total_cells = self.target_particles / particles_per_cell
         cells_per_side = int(np.cbrt(total_cells))
 
-        aspect_xy = self.domain_x / self.domain_y
-        aspect_xz = self.domain_x / self.domain_z
+        # Calculate dimensions for the narrow funnel region
+        aspect_xy = funnel_domain_x / funnel_domain_y
+        aspect_xz = funnel_domain_x / self.domain_z
 
-        dim_x = int(cells_per_side * np.cbrt(aspect_xy * aspect_xz))
-        dim_y = int(cells_per_side * np.cbrt(1.0 / aspect_xy))
-        dim_z = int(cells_per_side * np.cbrt(1.0 / aspect_xz))
+        dim_x_funnel = int(cells_per_side * np.cbrt(aspect_xy * aspect_xz))
+        dim_y_funnel = int(cells_per_side * np.cbrt(1.0 / aspect_xy))
+        dim_z_funnel = int(cells_per_side * np.cbrt(1.0 / aspect_xz))
 
-        # Recalculate voxel size based on actual grid
-        actual_voxel = min(
-            self.domain_x / dim_x, self.domain_y / dim_y, self.domain_z / dim_z
+        # Calculate cell sizes for the funnel (maintaining proper aspect ratios)
+        cell_size_x_funnel = funnel_domain_x / dim_x_funnel
+        cell_size_y_funnel = funnel_domain_y / dim_y_funnel
+        cell_size_z_funnel = self.domain_z / dim_z_funnel
+        cell_volume_funnel = (
+            cell_size_x_funnel * cell_size_y_funnel * cell_size_z_funnel
         )
-        self.voxel_size = actual_voxel
 
-        cell_size_x = self.domain_x / dim_x
-        cell_size_y = self.domain_y / dim_y
-        cell_size_z = self.domain_z / dim_z
-        cell_volume = cell_size_x * cell_size_y * cell_size_z
-
-        radius = max(cell_size_x, cell_size_y, cell_size_z) * 0.5
-        mass = cell_volume * density
-
-        print(f"\nParticle grid:")
-        print(f"  Grid cells: {dim_x} x {dim_y} x {dim_z}")
-        print(f"  Grid points: {dim_x + 1} x {dim_y + 1} x {dim_z + 1}")
-        print(f"  Voxel size: {self.voxel_size:.4f} m")
-        print(
-            f"  Cell size: {cell_size_x:.4f} x {cell_size_y:.4f} x {cell_size_z:.4f} m"
+        # Recalculate voxel size and mass for funnel
+        self.voxel_size = min(
+            cell_size_x_funnel, cell_size_y_funnel, cell_size_z_funnel
         )
-        print(f"  Particle mass: {mass:.6f} kg")
+        radius_funnel = (
+            max(cell_size_x_funnel, cell_size_y_funnel, cell_size_z_funnel) * 0.5
+        )
+        mass_funnel = cell_volume_funnel * density
+
+        print(f"\nPour particle grid:")
+        print(f"  Stream dimensions: narrow column for pouring effect")
         print(f"  Target particles: {self.target_particles:,}")
+        print(f"  Base spawn height: {spawn_height:.2f}m above ground")
 
-        # Spawn particles above the container so they fall in
-        spawn_height = self.domain_z + 0.5  # 0.5m above container
+        # Center the spawn region above the container
+        spawn_center_x = self.domain_x / 2
+        spawn_center_y = self.domain_y / 2
 
+        # POUR SPAWN: Create a narrow stream that pours down like from a funnel
+        # Instead of multiple clusters, create one continuous column with extreme randomness
+
+        # Narrow stream dimensions - like a funnel pouring
+        stream_width_factor = 0.15  # 15% of domain - narrow stream
+        stream_domain_x = self.domain_x * stream_width_factor
+        stream_domain_y = self.domain_y * stream_width_factor
+
+        # Calculate cell count for the stream to achieve target particles
+        # Make it tall and narrow
+        stream_cells_total = self.target_particles / particles_per_cell
+        stream_cells_z = int(np.cbrt(stream_cells_total) * 2.5)  # Extra tall
+        stream_cells_xy = int(np.sqrt(stream_cells_total / stream_cells_z))
+
+        stream_dim_x = max(3, stream_cells_xy)
+        stream_dim_y = max(3, stream_cells_xy)
+        stream_dim_z = max(20, stream_cells_z)  # At least 20 layers tall
+
+        # Cell sizes for the narrow stream
+        stream_cell_x = stream_domain_x / stream_dim_x
+        stream_cell_y = stream_domain_y / stream_dim_y
+        stream_cell_z = (self.domain_z * 3) / stream_dim_z  # Stretch vertically
+
+        print(f"\n  Pour spawn: narrow stream")
+        print(
+            f"  Stream: {stream_domain_x:.2f}m x {stream_domain_y:.2f}m x {self.domain_z * 3:.2f}m"
+        )
+        print(f"  Grid: {stream_dim_x} x {stream_dim_y} x {stream_dim_z}")
+
+        total_particles_spawned = 0
+
+        # Create ONE continuous stream above the tile center
+        # Center it over the small tile
+        stream_center_x = self.domain_x / 2
+        stream_center_y = self.domain_y / 2
+        stream_base_height = spawn_height
+
+        # Use maximum jitter to break up the grid into a fluid-like mass
         builder.add_particle_grid(
-            pos=wp.vec3(0.0, 0.0, spawn_height),  # Start above container
+            pos=wp.vec3(
+                stream_center_x - stream_domain_x / 2,
+                stream_center_y - stream_domain_y / 2,
+                stream_base_height,
+            ),
             rot=wp.quat_identity(),
-            vel=wp.vec3(0.0, 0.0, 0.0),  # Start at rest - let lunar gravity do the work
-            dim_x=dim_x + 1,
-            dim_y=dim_y + 1,
-            dim_z=dim_z + 1,
-            cell_x=cell_size_x,
-            cell_y=cell_size_y,
-            cell_z=cell_size_z,
-            mass=mass,
-            jitter=2.0 * radius,
-            radius_mean=radius,
+            vel=wp.vec3(0.0, 0.0, 0.0),  # Start at rest - pure gravity fall
+            dim_x=stream_dim_x,
+            dim_y=stream_dim_y,
+            dim_z=stream_dim_z,
+            cell_x=stream_cell_x,
+            cell_y=stream_cell_y,
+            cell_z=stream_cell_z,
+            mass=mass_funnel,
+            jitter=8.0 * radius_funnel,  # EXTREME jitter for fluid-like appearance
+            radius_mean=radius_funnel,
             flags=newton.ParticleFlags.ACTIVE,
         )
 
-        actual_particles = (dim_x + 1) * (dim_y + 1) * (dim_z + 1)
-        print(f"  Actual particles: {actual_particles:,}")
+        stream_particles = stream_dim_x * stream_dim_y * stream_dim_z
+        total_particles_spawned = stream_particles
+
+        print(f"  Total particles spawned: {total_particles_spawned:,}")
         print(
-            f"  Spawn height: {spawn_height:.2f}m above container (lunar gravity will do the work)"
+            f"  Stream height: {stream_base_height:.2f}m to {stream_base_height + stream_dim_z * stream_cell_z:.2f}m"
         )
+        print(f"  Pouring onto small tile - will pile up and spill over")
 
     def add_container(self, builder, options):
         """Add rigid container boundaries"""
@@ -201,76 +252,35 @@ class LunarRegolithSimulation:
 
         wall_thickness = 0.02  # 2cm
 
-        # Ground plane (always present)
-        builder.add_ground_plane(cfg=container_cfg)
+        # Make floor tile smaller than spawn area so regolith falls off edges
+        # Floor is 50% of domain size, centered under spawn
+        floor_scale = 0.5
+        floor_half_x = self.domain_x * floor_scale / 2
+        floor_half_y = self.domain_y * floor_scale / 2
+
+        # Ground plane as explicit collision box - smaller than spawn
+        builder.add_shape_box(
+            body=-1,
+            cfg=container_cfg,
+            xform=wp.transform(
+                wp.vec3(self.domain_x / 2, self.domain_y / 2, -wall_thickness / 2),
+                wp.quat_identity(),
+            ),
+            hx=floor_half_x,
+            hy=floor_half_y,
+            hz=wall_thickness / 2,
+        )
+
+        print(f"\nContainer:")
+        print(f"  Ground: small collision box ({floor_scale * 100:.0f}% of domain)")
+        print(f"  Size: {floor_half_x * 2:.2f}m x {floor_half_y * 2:.2f}m")
+        print(f"  Regolith will pile on tile and spill over edges")
 
         if options.walled_container:
-            # Back wall (y=0)
-            builder.add_shape_box(
-                body=-1,
-                cfg=container_cfg,
-                xform=wp.transform(
-                    wp.vec3(self.domain_x / 2, -wall_thickness / 2, self.domain_z / 2),
-                    wp.quat_identity(),
-                ),
-                hx=self.domain_x / 2,
-                hy=wall_thickness / 2,
-                hz=self.domain_z / 2,
-            )
-
-            # Front wall (y=domain_y)
-            builder.add_shape_box(
-                body=-1,
-                cfg=container_cfg,
-                xform=wp.transform(
-                    wp.vec3(
-                        self.domain_x / 2,
-                        self.domain_y + wall_thickness / 2,
-                        self.domain_z / 2,
-                    ),
-                    wp.quat_identity(),
-                ),
-                hx=self.domain_x / 2,
-                hy=wall_thickness / 2,
-                hz=self.domain_z / 2,
-            )
-
-            # Left wall (x=0)
-            builder.add_shape_box(
-                body=-1,
-                cfg=container_cfg,
-                xform=wp.transform(
-                    wp.vec3(-wall_thickness / 2, self.domain_y / 2, self.domain_z / 2),
-                    wp.quat_identity(),
-                ),
-                hx=wall_thickness / 2,
-                hy=self.domain_y / 2,
-                hz=self.domain_z / 2,
-            )
-
-            # Right wall (x=domain_x)
-            builder.add_shape_box(
-                body=-1,
-                cfg=container_cfg,
-                xform=wp.transform(
-                    wp.vec3(
-                        self.domain_x + wall_thickness / 2,
-                        self.domain_y / 2,
-                        self.domain_z / 2,
-                    ),
-                    wp.quat_identity(),
-                ),
-                hx=wall_thickness / 2,
-                hy=self.domain_y / 2,
-                hz=self.domain_z / 2,
-            )
-
-            print(f"\nContainer:")
-            print(f"  Ground plane + 4 walls (boxed)")
+            print(f"  Ground + 4 walls (boxed)")
             print(f"  Wall thickness: {wall_thickness * 100:.1f} cm")
         else:
-            print(f"\nContainer:")
-            print(f"  Open ground plane (berm/pile formation)")
+            print(f"  Ground box (open - pile formation)")
             print(f"  Regolith will spread and pile naturally")
 
     def set_material_properties(self, options):
@@ -279,8 +289,6 @@ class LunarRegolithSimulation:
         num_particles = self.model.particle_count
 
         # Create index array for all particles
-        import numpy as np
-
         indices = wp.array(
             np.arange(num_particles), dtype=int, device=self.model.device
         )
@@ -399,7 +407,7 @@ def main():
     )
     parser.add_argument("--fps", type=float, default=30.0, help="Output frame rate")
     parser.add_argument(
-        "--substeps", type=int, default=5, help="Physics substeps per frame"
+        "--substeps", type=int, default=10, help="Physics substeps per frame"
     )
     parser.add_argument(
         "--gravity",
@@ -414,13 +422,13 @@ def main():
         "--density", type=float, default=1500.0, help="Material density (kg/m³)"
     )
     parser.add_argument(
-        "--young-modulus", type=float, default=50e6, help="Young's modulus (Pa)"
+        "--young-modulus", type=float, default=10e6, help="Young's modulus (Pa)"
     )
     parser.add_argument(
         "--poisson-ratio", type=float, default=0.3, help="Poisson's ratio"
     )
     parser.add_argument(
-        "--friction", type=float, default=0.6, help="Friction coefficient"
+        "--friction", type=float, default=0.85, help="Friction coefficient"
     )
     parser.add_argument(
         "--yield-pressure", type=float, default=5e3, help="Yield pressure (Pa)"
