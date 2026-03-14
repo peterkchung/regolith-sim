@@ -714,7 +714,7 @@ def main():
     parser.add_argument(
         "--yield-stress",
         type=float,
-        default=250.0,  # Cohesion from agglutinates and particle locking
+        default=0.0,  # No cohesion for now - needs better modeling
         help="Yield stress/cohesion (Pa)",
     )
     parser.add_argument(
