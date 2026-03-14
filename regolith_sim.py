@@ -214,18 +214,22 @@ class LunarRegolithSimulation:
         # Initialize MPM solver
         self.mpm_solver = SolverImplicitMPM(self.sand_model, mpm_config)
 
-        # Setup colliders from rigid body model (if available)
-        if has_rigid_bodies:
-            self.mpm_solver.setup_collider(model=self.rb_model)
-            # Debug: Check if colliders are properly set up
-            if hasattr(self.mpm_solver, "collider_body_index"):
-                print(
-                    f"  Colliders set up: {self.mpm_solver.collider_body_index.shape[0]} bodies"
-                )
-            else:
-                print("  WARNING: No collider_body_index found!")
+        # Setup colliders from rigid body model (always has at least ground plane)
+        self.mpm_solver.setup_collider(model=self.rb_model)
+
+        # Debug: Check if colliders are properly set up
+        if hasattr(self.mpm_solver, "collider_body_index"):
+            print(
+                f"  Colliders set up: {self.mpm_solver.collider_body_index.shape[0]} bodies "
+                f"({len([b for b in self.rb_model.body_name if b])} dynamic)"
+            )
         else:
-            # No rigid bodies, just use ground plane collision
+            print("  WARNING: No collider_body_index found!")
+
+        # Map from collider index to body index (only needed for two-way coupling)
+        if has_rigid_bodies:
+            self.collider_body_id = self.mpm_solver.collider_body_index
+        else:
             self.collider_body_id = None
 
         # Set per-particle material properties (stiff lunar regolith)
@@ -267,12 +271,6 @@ class LunarRegolithSimulation:
             max_nodes, value=-1, dtype=int, device=device
         )
         self._collect_collider_impulses()
-
-        # Map from collider index to body index
-        if has_rigid_bodies:
-            self.collider_body_id = self.mpm_solver.collider_body_index
-        else:
-            self.collider_body_id = None
 
         # Per-body forces from sand (only needed for two-way coupling)
         if has_rigid_bodies:
