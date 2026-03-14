@@ -113,41 +113,42 @@ class LunarRegolithSimulation:
             pass
 
         # ============================================================
-        # RIGID BODY MODEL (optional, requires MuJoCo)
+        # RIGID BODY MODEL (always has ground plane, optionally has rocks)
         # ============================================================
-        if self.has_mujoco and options.add_rigid_bodies:
-            rb_builder = newton.ModelBuilder()
-            rb_builder.default_shape_cfg.mu = options.ground_friction
+        rb_builder = newton.ModelBuilder()
+        rb_builder.default_shape_cfg.mu = options.ground_friction
 
-            # Add ground plane
-            rb_builder.add_ground_plane(
-                cfg=newton.ModelBuilder.ShapeConfig(mu=options.ground_friction)
+        # ALWAYS add ground plane (visible terrain)
+        rb_builder.add_ground_plane(
+            cfg=newton.ModelBuilder.ShapeConfig(mu=options.ground_friction)
+        )
+
+        # Add rigid bodies (rocks) if MuJoCo is available and requested
+        if self.has_mujoco and options.add_rigid_bodies:
+            self._emit_rigid_bodies(rb_builder, options)
+            print("  Added rigid rocks for two-way coupling")
+        elif options.add_rigid_bodies and not self.has_mujoco:
+            print(
+                "  Warning: MuJoCo not installed, skipping rigid bodies. "
+                "Install with: uv add mujoco"
             )
 
-            # Add any rigid bodies (rocks, tools, etc.)
-            self._emit_rigid_bodies(rb_builder, options)
+        # Finalize rigid body model (always has at least ground plane)
+        self.rb_model = rb_builder.finalize()
+        self.rb_model.set_gravity(options.gravity)
 
-            # Finalize rigid body model
-            self.rb_model = rb_builder.finalize()
-            self.rb_model.set_gravity(options.gravity)
-
-            # Setup rigid body solver (MuJoCo)
+        # Setup rigid body solver only if we have dynamic bodies (not just ground)
+        has_dynamic_bodies = self.has_mujoco and options.add_rigid_bodies
+        if has_dynamic_bodies:
             self.rb_solver = newton.solvers.SolverMuJoCo(
                 self.rb_model, use_mujoco_contacts=False, njmax=100
             )
-
             has_rigid_bodies = True
             print("  Rigid body solver: MuJoCo (two-way coupling enabled)")
         else:
-            if options.add_rigid_bodies and not self.has_mujoco:
-                print(
-                    "  Warning: MuJoCo not installed, skipping rigid bodies. "
-                    "Install with: uv add mujoco"
-                )
-            self.rb_model = None
             self.rb_solver = None
             has_rigid_bodies = False
-            print("  Rigid body solver: None (MPM-only mode)")
+            print("  Rigid body solver: None (ground only)")
 
         # ============================================================
         # SAND/REGOLITH MODEL (MPM particles)
