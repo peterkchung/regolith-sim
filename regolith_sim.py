@@ -276,10 +276,10 @@ class LunarRegolithSimulation:
         else:
             self.body_sand_forces = None
 
-        # Particle render colors
+        # Particle render colors (lunar gray - not sandy)
         self.particle_render_colors = wp.full(
             self.sand_model.particle_count,
-            value=wp.vec3(0.7, 0.6, 0.4),  # Sandy color
+            value=wp.vec3(0.5, 0.5, 0.52),  # Lunar gray with slight blue tint
             dtype=wp.vec3,
             device=self.sand_model.device,
         )
@@ -682,54 +682,57 @@ def main():
         "--ground-friction", type=float, default=0.5, help="Ground friction"
     )
 
-    # Material properties (LUNAR REGOLITH - stable for simulation)
-    # Realistic values based on lunar soil properties
+    # Material properties (LUNAR REGOLITH - based on Apollo sample data)
+    # Source: Mitchell et al. (1972), Carrier et al. (1991)
     parser.add_argument(
-        "--density", type=float, default=1500.0, help="Material density (kg/m³)"
+        "--density", type=float, default=1600.0, help="Material density (kg/m³)"
     )
     parser.add_argument(
         "--young-modulus",
         type=float,
-        default=1.0e7,  # 10 MPa - realistic for compacted regolith (was 1e15)
+        default=5.0e6,  # 5 MPa - typical for lunar regolith at 1.5g/cm³
         help="Young's modulus (Pa)",
     )
     parser.add_argument(
         "--poisson-ratio",
         type=float,
-        default=0.3,  # Like the granular example
+        default=0.25,  # Lower for angular, interlocked particles
         help="Poisson's ratio",
     )
     parser.add_argument(
         "--friction",
         type=float,
-        default=0.6,  # Realistic for lunar regolith (~31°)
+        default=0.9,  # High friction ~42° (lunar regolith is very angular)
         help="Friction coefficient",
     )
     parser.add_argument(
         "--yield-pressure",
         type=float,
-        default=1.0e4,  # 10 kPa - realistic yield stress (was 1e12)
+        default=2.0e3,  # 2 kPa - cohesion from particle interlocking
         help="Yield pressure (Pa)",
     )
     parser.add_argument(
-        "--yield-stress", type=float, default=0.0, help="Yield stress (Pa)"
+        "--yield-stress",
+        type=float,
+        default=500.0,  # Cohesion from agglutinates and particle locking
+        help="Yield stress/cohesion (Pa)",
     )
     parser.add_argument(
         "--tensile-yield-ratio",
         type=float,
-        default=0.0,
-        help="Tensile yield ratio (0 for dry sand)",
+        default=0.1,  # Some tensile strength from cohesion
+        help="Tensile yield ratio",
     )
     parser.add_argument(
         "--hardening",
         type=float,
-        default=0.0,
-        help="Hardening factor (0 for loose sand)",
+        default=0.3,  # Moderate hardening as particles lock under pressure
+        help="Hardening factor",
     )
     parser.add_argument(
         "--damping",
         type=float,
-        default=0.0,
+        default=0.05,  # Slight damping for energy dissipation
         help="Viscous damping",
     )
 
