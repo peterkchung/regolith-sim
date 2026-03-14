@@ -219,10 +219,8 @@ class LunarRegolithSimulation:
 
         # Debug: Check if colliders are properly set up
         if hasattr(self.mpm_solver, "collider_body_index"):
-            print(
-                f"  Colliders set up: {self.mpm_solver.collider_body_index.shape[0]} bodies "
-                f"({len([b for b in self.rb_model.body_name if b])} dynamic)"
-            )
+            n_colliders = self.mpm_solver.collider_body_index.shape[0]
+            print(f"  Colliders set up: {n_colliders} bodies")
         else:
             print("  WARNING: No collider_body_index found!")
 
