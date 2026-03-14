@@ -249,6 +249,15 @@ class LunarRegolithSimulation:
             if hasattr(self.viewer, "set_camera"):
                 self.viewer.set_camera(camera_pos, pitch=-35.0, yaw=180.0)
 
+        # Evaluate forward kinematics (required for proper initialization)
+        if has_rigid_bodies:
+            newton.eval_fk(
+                self.rb_model,
+                self.rb_model.joint_q,
+                self.rb_model.joint_qd,
+                self.rb_state_0,
+            )
+
         # Additional buffers for two-way coupling
         max_nodes = 1 << 20
         self.collider_impulses = wp.zeros(max_nodes, dtype=wp.vec3, device=device)
@@ -460,6 +469,7 @@ class LunarRegolithSimulation:
 
     def _simulate(self):
         """Run one frame of simulation with optional two-way coupling"""
+        # Run all rigid body substeps first (like Newton example)
         for _ in range(self.sim_substeps):
             if self.has_rigid_bodies:
                 # Clear forces on rigid bodies
@@ -503,8 +513,8 @@ class LunarRegolithSimulation:
                 # Swap rigid body states
                 self.rb_state_0, self.rb_state_1 = self.rb_state_1, self.rb_state_0
 
-            # Simulate sand (with or without rigid body coupling)
-            self._simulate_sand()
+        # Simulate sand ONCE after all rigid body substeps (like Newton example)
+        self._simulate_sand()
 
     def _simulate_sand(self):
         """Simulate sand particles with optional two-way coupling"""
@@ -534,7 +544,7 @@ class LunarRegolithSimulation:
             dt=self.frame_dt,
         )
 
-        # Save impulses for next rigid body step (if using coupling)
+        # Save impulses for next rigid body step (collect AFTER MPM step)
         if self.has_rigid_bodies:
             self._collect_collider_impulses()
 
