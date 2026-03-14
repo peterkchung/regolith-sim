@@ -663,15 +663,15 @@ def main():
         help="Gravity vector (m/s²)",
     )
 
-    # Bed dimensions
+    # Bed dimensions (narrower defaults for visible piling)
     parser.add_argument(
-        "--bed-width", type=float, default=1.0, help="Sand bed width (m)"
+        "--bed-width", type=float, default=0.5, help="Sand bed width (m)"
     )
     parser.add_argument(
-        "--bed-depth", type=float, default=1.0, help="Sand bed depth (m)"
+        "--bed-depth", type=float, default=0.5, help="Sand bed depth (m)"
     )
     parser.add_argument(
-        "--bed-height", type=float, default=0.5, help="Sand bed height (m)"
+        "--bed-height", type=float, default=1.0, help="Sand bed height (m)"
     )
 
     # Rigid body options
